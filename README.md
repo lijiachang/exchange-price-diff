@@ -5,7 +5,7 @@
 
 # change config.toml
 ```
-symbols = ["ETH_USDT", "SOL_USDT", "XRP_USDT"]
+symbols = ["ETH_USDT", "SOL_USDT", "BNB_USDT"]
 ```
 
 # Run
