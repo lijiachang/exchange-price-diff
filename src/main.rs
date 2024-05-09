@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::fs::{metadata, OpenOptions};
 use std::io::Write;
+use std::path::Path;
 use std::string::ToString;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -102,16 +104,21 @@ fn round_to_precision(num: f64, precision: f64) -> f64 {
     (num * multiple).round() / multiple
 }
 
-fn write_orderbook_csv(file_name: &str, data: &[OrderbookMsg]) {
+fn write_orderbook_csv(file_path: &str, data: &[OrderbookMsg]) {
+    //data/exchange_name/symbol_name/orderbook/date.csv
+    // 创建目录（如果不存在）
+    let dir_path = Path::new(file_path).parent().unwrap();
+    fs::create_dir_all(dir_path).unwrap();
+
     let mut file = OpenOptions::new()
         .write(true)
         .append(true)
         .create(true)
-        .open(file_name)
+        .open(file_path)
         .unwrap();
 
     // 检查文件是否已经存在且不为空, 写入表头
-    let need_write_headers = match metadata(file_name) {
+    let need_write_headers = match metadata(file_path) {
         Ok(meta) => meta.len() == 0,
         Err(_) => true,
     };
@@ -136,19 +143,22 @@ fn write_orderbook_csv(file_name: &str, data: &[OrderbookMsg]) {
         }
         writeln!(file, "{}", row.join(",")).unwrap();
     }
-    println!("{} Write {} records to {}", Local::now().format("%Y-%m-%d %H:%M:%S"), data.len(), file_name);
+    println!("{} Write {} records to {}", Local::now().format("%Y-%m-%d %H:%M:%S"), data.len(), file_path);
 }
 
-fn write_trade_csv(file_name: &str, data: &[TradeMsg]) {
+fn write_trade_csv(file_path: &str, data: &[TradeMsg]) {
+    let dir_path = Path::new(file_path).parent().unwrap();
+    fs::create_dir_all(dir_path).unwrap();
+
     let mut file = OpenOptions::new()
         .write(true)
         .append(true)
         .create(true)
-        .open(file_name)
+        .open(file_path)
         .unwrap();
 
     // 检查文件是否已经存在且不为空, 写入表头
-    let need_write_headers = match metadata(file_name) {
+    let need_write_headers = match metadata(file_path) {
         Ok(meta) => meta.len() == 0,
         Err(_) => true,
     };
@@ -169,11 +179,11 @@ fn write_trade_csv(file_name: &str, data: &[TradeMsg]) {
         ];
         writeln!(file, "{}", row.join(",")).unwrap();
     }
-    println!("{} Write {} records to {}", Local::now().format("%Y-%m-%d %H:%M:%S"), data.len(), file_name);
+    println!("{} Write {} records to {}", Local::now().format("%Y-%m-%d %H:%M:%S"), data.len(), file_path);
 }
 
 /// 获取Gate合约信息（合约乘数）
-async fn get_gate_markets() -> Arc<std::collections::HashMap<String, Market>> {
+async fn get_gate_markets() -> Arc<HashMap<String, Market>> {
     let markets = tokio::task::spawn_blocking(|| { fetch_markets("gate", MarketType::LinearSwap).unwrap() })
         .await
         .unwrap();
@@ -182,7 +192,7 @@ async fn get_gate_markets() -> Arc<std::collections::HashMap<String, Market>> {
 
     let markets_map = markets.into_iter()
         .map(|m| (m.symbol.clone(), m))
-        .collect::<std::collections::HashMap<String, Market>>();
+        .collect::<HashMap<String, Market>>();
 
     Arc::new(markets_map)
 }
@@ -199,9 +209,9 @@ async fn main() {
     let config_str = fs::read_to_string("config.toml").expect("Failed to read config file");
     let config: Config = toml::from_str(&config_str).expect("Failed to parse config file");
 
-    let binance_symbols: Vec<String> = config.symbols.iter().map(|x| x.replace("_", "").to_string()).collect();
+    let binance_symbols: Arc<Vec<String>> = Arc::new(config.symbols.iter().map(|x| x.replace("_", "").to_string()).collect());
     println!("binance_symbols: {:?}", &binance_symbols);
-    let gate_symbols: Vec<String> = config.symbols.iter().map(|x| x.to_string()).collect();
+    let gate_symbols: Arc<Vec<String>> = Arc::new(config.symbols.iter().map(|x| x.to_string()).collect());
     println!("gate_symbols: {:?}", &gate_symbols);
 
     // 合约信息map
@@ -233,37 +243,52 @@ async fn main() {
     });
 
     // Consume messages and write to CSV files
-    tokio::spawn(async move {
-        let mut binance_orderbooks = vec![];
-        while let Ok(msg) = binance_orderbook_rx.recv() {
-            let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as i64;
-            let parsed_msg: serde_json::Value = serde_json::from_str(&msg.json).unwrap();
-            let data = parsed_msg["data"].as_object().unwrap();
-            let timestamp = data["T"].as_i64().unwrap();
-            let asks: Vec<(f64, f64)> = data["a"].as_array().unwrap().iter().map(|x| (x[0].as_str().unwrap().parse().unwrap(), x[1].as_str().unwrap().parse().unwrap())).collect();
-            let bids: Vec<(f64, f64)> = data["b"].as_array().unwrap().iter().map(|x| (x[0].as_str().unwrap().parse().unwrap(), x[1].as_str().unwrap().parse().unwrap())).collect();
-            let orderbook_msg = OrderbookMsg {
-                timestamp,
-                local_timestamp,
-                exchange: BINANCE.to_string(),
-                symbol: data["s"].as_str().unwrap().to_string(),
-                asks,
-                bids,
-            };
-            binance_orderbooks.push(orderbook_msg);
-            if binance_orderbooks.len() >= 100 {
-                write_orderbook_csv("binance_orderbook.csv", &binance_orderbooks);
-                binance_orderbooks.clear();
+    tokio::spawn({
+        let binance_symbols = binance_symbols.clone();
+        async move {
+            let mut symbol_orderbooks: HashMap<String, Vec<OrderbookMsg>> = binance_symbols.iter()
+                .map(|x| (x.to_string(), vec![]))
+                .collect();
+
+            while let Ok(msg) = binance_orderbook_rx.recv() {
+                let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as i64;
+                let parsed_msg: serde_json::Value = serde_json::from_str(&msg.json).unwrap();
+                let data = parsed_msg["data"].as_object().unwrap();
+                let symbol = data["s"].as_str().unwrap().to_string();
+                let timestamp = data["T"].as_i64().unwrap();
+                let asks: Vec<(f64, f64)> = data["a"].as_array().unwrap().iter().map(|x| (x[0].as_str().unwrap().parse().unwrap(), x[1].as_str().unwrap().parse().unwrap())).collect();
+                let bids: Vec<(f64, f64)> = data["b"].as_array().unwrap().iter().map(|x| (x[0].as_str().unwrap().parse().unwrap(), x[1].as_str().unwrap().parse().unwrap())).collect();
+                let orderbook_msg = OrderbookMsg {
+                    timestamp,
+                    local_timestamp,
+                    exchange: BINANCE.to_string(),
+                    symbol: symbol.clone(),
+                    asks,
+                    bids,
+                };
+                let orderbooks = symbol_orderbooks.get_mut(&symbol).unwrap();
+                orderbooks.push(orderbook_msg);
+
+                if orderbooks.len() >= 100 {
+                    let date = Local::now().format("%Y-%m-%d");
+                    let file_path = format!("data/{BINANCE}/{symbol}/orderbook/{date}.csv");
+                    write_orderbook_csv(&*file_path, orderbooks);
+                    orderbooks.clear();
+                }
             }
         }
     });
 
     tokio::spawn({
+        let gate_symbols = Arc::clone(&gate_symbols);
         let gate_markets = Arc::clone(&gate_markets);
         async move {
-            let mut gate_orderbooks = vec![];
+            let mut symbol_orderbooks: HashMap<String, Vec<OrderbookMsg>> = gate_symbols.iter()
+                .map(|x| (x.to_string(), vec![]))
+                .collect();
+
             while let Ok(msg) = gate_orderbook_rx.recv() {
-                let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as i64;
+                let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as i64;
                 let parsed_msg: serde_json::Value = serde_json::from_str(&msg.json).unwrap();
                 let data = parsed_msg["result"].as_object().unwrap();
                 let timestamp = data["t"].as_i64().unwrap();
@@ -276,53 +301,75 @@ async fn main() {
                 let bids: Vec<(f64, f64)> = data["bids"].as_array().unwrap().iter()
                     .map(|x| (x["p"].as_str().unwrap().parse().unwrap(), round_to_precision(x["s"].as_f64().unwrap() * contract_value, *contract_value)))
                     .collect();
+                let symbol = contract.replace("_", "");
                 let orderbook_msg = OrderbookMsg {
                     timestamp,
                     local_timestamp,
                     exchange: GATE.to_string(),
-                    symbol: contract.replace("_", ""),
+                    symbol: symbol.clone(),
                     asks,
                     bids,
                 };
-                gate_orderbooks.push(orderbook_msg);
-                if gate_orderbooks.len() >= 100 {
-                    write_orderbook_csv("gate_orderbook.csv", &gate_orderbooks);
-                    gate_orderbooks.clear();
+
+                let orderbooks = symbol_orderbooks.get_mut(&contract).unwrap();
+                orderbooks.push(orderbook_msg);
+
+                if orderbooks.len() >= 100 {
+                    let date = Local::now().format("%Y-%m-%d");
+                    let file_path = format!("data/{GATE}/{symbol}/orderbook/{date}.csv");
+                    write_orderbook_csv(&*file_path, orderbooks);
+                    orderbooks.clear();
                 }
             }
         }
     });
 
-    tokio::spawn(async move {
-        let mut binance_trades = vec![];
-        while let Ok(msg) = binance_trade_rx.recv() {
-            let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as i64;
-            let parsed_msg: serde_json::Value = serde_json::from_str(&msg.json).unwrap();
-            let data = parsed_msg["data"].as_object().unwrap();
-            let timestamp = data["T"].as_i64().unwrap();
-            let trade_msg = TradeMsg {
-                timestamp,
-                local_timestamp,
-                exchange: BINANCE.to_string(),
-                symbol: data["s"].as_str().unwrap().to_string(),
-                side: if data["m"] == true { "SELL".to_string() } else { "BUY".to_string() },
-                price: data["p"].as_str().unwrap().parse().unwrap(),
-                qty: data["q"].as_str().unwrap().parse().unwrap(),
-            };
-            binance_trades.push(trade_msg);
-            if binance_trades.len() >= 100 {
-                write_trade_csv("binance_trade.csv", &binance_trades);
-                binance_trades.clear();
+    tokio::spawn({
+        let binance_symbols = binance_symbols.clone();
+        async move {
+            let mut symbol_trades: HashMap<String, Vec<TradeMsg>> = binance_symbols.iter()
+                .map(|x| (x.to_string(), vec![]))
+                .collect();
+
+            while let Ok(msg) = binance_trade_rx.recv() {
+                let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as i64;
+                let parsed_msg: serde_json::Value = serde_json::from_str(&msg.json).unwrap();
+                let data = parsed_msg["data"].as_object().unwrap();
+                let symbol = data["s"].as_str().unwrap().to_string();
+                let timestamp = data["T"].as_i64().unwrap();
+                let trade_msg = TradeMsg {
+                    timestamp,
+                    local_timestamp,
+                    exchange: BINANCE.to_string(),
+                    symbol: symbol.clone(),
+                    side: if data["m"] == true { "SELL".to_string() } else { "BUY".to_string() },
+                    price: data["p"].as_str().unwrap().parse().unwrap(),
+                    qty: data["q"].as_str().unwrap().parse().unwrap(),
+                };
+
+                let trades = symbol_trades.get_mut(&symbol).unwrap();
+                trades.push(trade_msg);
+
+                if trades.len() >= 100 {
+                    let date = Local::now().format("%Y-%m-%d");
+                    let file_path = format!("data/{BINANCE}/{symbol}/trade/{date}.csv");
+                    write_trade_csv(&*file_path, trades);
+                    trades.clear();
+                }
             }
         }
     });
 
     tokio::spawn({
+        let gate_symbols = Arc::clone(&gate_symbols);
         let gate_markets = Arc::clone(&gate_markets);
         async move {
-            let mut gate_trades = vec![];
+            let mut symbol_trades: HashMap<String, Vec<TradeMsg>> = gate_symbols.iter()
+                .map(|x| (x.to_string(), vec![]))
+                .collect();
+
             while let Ok(msg) = gate_trade_rx.recv() {
-                let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as i64;
+                let local_timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as i64;
                 let parsed_msg: serde_json::Value = serde_json::from_str(&msg.json).unwrap();
                 let data = parsed_msg["result"].as_array().unwrap();
 
@@ -342,11 +389,18 @@ async fn main() {
                         price: item["price"].as_str().unwrap().parse().unwrap(),
                         qty: round_to_precision(qty.abs(), *contract_value),
                     };
-                    gate_trades.push(trade_msg);
+                    let trades = symbol_trades.get_mut(&contract).unwrap();
+                    trades.push(trade_msg);
                 }
-                if gate_trades.len() >= 100 {
-                    write_trade_csv("gate_trade.csv", &gate_trades);
-                    gate_trades.clear();
+
+                for (contract, trades) in symbol_trades.iter_mut() {
+                    if trades.len() >= 100 {
+                        let date = Local::now().format("%Y-%m-%d");
+                        let symbol = contract.replace("_", "");
+                        let file_path = format!("data/{GATE}/{symbol}/trade/{date}.csv");
+                        write_trade_csv(&*file_path, trades);
+                        trades.clear();
+                    }
                 }
             }
         }
